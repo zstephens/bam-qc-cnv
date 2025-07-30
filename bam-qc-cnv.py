@@ -6,8 +6,6 @@ import math
 import matplotlib.pyplot as mpl
 import numpy as np
 import pathlib
-import pysam
-import re
 import sys
 import time
 
@@ -18,7 +16,7 @@ from matplotlib.collections import PatchCollection
 from source.bimodal_gaussian import fit_bimodal_gaussian
 from source.globals          import *
 from source.ref_info         import REFFILE_NAMES, LEXICO_2_IND
-from source.util             import compute_n50, find_indices_in_range, log_px, makedir, reads_2_cov, strip_polymerase_coords
+from source.util             import process_bam_coverage, find_indices_in_range, log_px, makedir
 
 
 def main(raw_args=None):
@@ -40,7 +38,8 @@ def main(raw_args=None):
     parser.add_argument('-b',  type=str, required=False, help="bed file of targeted regions",                   metavar='',          default='')
     parser.add_argument('-r',  type=str, required=False, help="refname: t2t / hg38 / hg19",                     metavar='hg38',      default='hg38')
     parser.add_argument('-rt', type=str, required=False, help="read type: hifi / clr / ont",                    metavar='hifi',      default='hifi')
-    parser.add_argument('--report-cnvs', required=False, help="[EXPERIMENTAL] report CNVs",                     action='store_true', default=False)
+    parser.add_argument('--report-cnvs', required=False, help="report CNVs",                                    metavar='model',     default='')
+    parser.add_argument('--renormalize', required=False, help="renormalize coverage using this region",         metavar=('chr','start','end','copynum'), type=str, nargs=4)
     args = parser.parse_args()
 
     IN_BAM = args.i
@@ -67,10 +66,14 @@ def main(raw_args=None):
     CNV_MINVAR = max(1, args.cv)
     METHYL_MINSITES = max(1, args.mv)
 
+    RENORMALIZE_TUPLE = None
+    if args.renormalize:
+        RENORMALIZE_TUPLE = (args.renormalize[0], int(args.renormalize[1]), int(args.renormalize[2]), int(args.renormalize[3]))
+
     HOM_VAF_THRESH = 0.900
 
     # don't plot coverage if we're <= this many windows away from unstable regions
-    BUFFER_UNSTABLE_COV = max(int(1000000/VAR_WINDOW), 1)
+    BUFFER_UNSTABLE_COV = max(int(1000000/WINDOW_SIZE), 1)
 
     # don't call CNVs if we're <= this many bp away from unstable regions
     BUFFER_UNSTABLE_CNV = 2000000
@@ -87,10 +90,21 @@ def main(raw_args=None):
     VAR_FILT_WHITELIST = args.vw.split(',')
     VAR_FILT_BLACKLIST = args.vb.split(',')
 
+    sim_path = str(pathlib.Path(__file__).resolve().parent)
+    resource_dir = sim_path + '/resources/'
+
     REPORT_COPYNUM = args.report_cnvs
+    SVM_SCALAR = None
+    SVM_MODEL = None
+    if REPORT_COPYNUM:
+        if REPORT_COPYNUM not in ['hifi', 'illumina']:
+            print('Error: --report-cnvs must be hifi or illumina')
+            exit(1)
+        SVM_SCALAR = joblib.load(f'{resource_dir}svm_scaler_{REPORT_COPYNUM}.pkl')
+        SVM_MODEL = joblib.load(f'{resource_dir}svm_classifier_{REPORT_COPYNUM}.pkl')
 
     if REPORT_COPYNUM and not(IN_VCF):
-        print('Error: --report-cnv requires an input vcf (-v)')
+        print('Error: --report-cnvs requires an input vcf (-v)')
         exit(1)
 
     OUT_NPZ = f'{OUT_DIR}cov.npz'
@@ -122,8 +136,6 @@ def main(raw_args=None):
                 (p1, p2) = sorted([int(splt[1]), int(splt[2])])
                 bed_regions[splt[0]].append((p1, p2, bed_annot))
 
-    sim_path = str(pathlib.Path(__file__).resolve().parent)
-    resource_dir = sim_path + '/resources/'
     CYTOBAND_BED = resource_dir + f'{REF_VERS}-cytoband.bed'
     cyto_by_chr = {}
     unstable_by_chr = {}
@@ -137,113 +149,21 @@ def main(raw_args=None):
             if splt[4] in UNSTABLE_REGION:
                 unstable_by_chr[splt[0]].append((int(splt[1]), int(splt[2])))
 
-    SVM_SCALAR = joblib.load(resource_dir + 'svm_scaler.pkl')
-    SVM_MODEL = joblib.load(resource_dir + 'svm_classifier.pkl')
+    if REF_VERS not in REFFILE_NAMES:
+        print('Error: -r must be one of the following:')
+        print(sorted(REFFILE_NAMES.keys()))
+        exit(1)
+    CONTIG_SIZES = REFFILE_NAMES[REF_VERS]
+    print(f'using reference: {REF_VERS}')
 
-    prev_ref = None
-    rnm_dict = {}
-    alns_by_zmw = []    # alignment start/end per zmw
-    rlen_by_zmw = []    # max tlen observed for each zmw
-    covdat_by_ref = {}  #
-    all_bed_result = []
-    tt = time.perf_counter()
-
+    #
+    # process BAM to get coverage and QC metrics
+    #
     if IN_BAM[-4:].lower() == '.bam':
-        #
-        if REF_VERS not in REFFILE_NAMES:
-            print('Error: -r must be one of the following:')
-            print(sorted(REFFILE_NAMES.keys()))
-            exit(1)
-        CONTIG_SIZES = REFFILE_NAMES[REF_VERS]
-        print(f'using reference: {REF_VERS}')
-        #
-        qc_metrics = {}
-        qc_metrics['bases_q20'] = 0
 
-        #
-        samfile = pysam.AlignmentFile(IN_BAM, "rb")
-        refseqs = samfile.references
-        #
-        for aln in samfile.fetch(until_eof=True):
-            splt = str(aln).split('\t')
-            my_ref_ind  = splt[2].replace('#','')
-            # pysam weirdness
-            if my_ref_ind.isdigit():
-                splt[2] = refseqs[int(my_ref_ind)]
-            elif my_ref_ind == '-1':
-                splt[2] = refseqs[-1]
-            else:
-                splt[2] = my_ref_ind
-            #
-            ref   = splt[2]
-            pos   = int(splt[3])
-            mapq  = int(splt[4])
-            cigar = splt[5]
-
-            if ref == '*':      # skip unmapped reads
-                continue
-            if mapq < MIN_MAPQ:
-                continue
-            #if pos > 1000000:  # for debugging purposes
-            #   continue
-
-            if not(aln.is_supplementary) and not(aln.is_secondary):
-                qc_metrics['bases_q20'] += sum(1 for n in aln.query_qualities if n >= 20)
-
-            if READ_MODE == 'clr':
-                rnm = strip_polymerase_coords(splt[0])
-                template_len = splt[0].split('/')[-1].split('_')
-                template_len = int(template_len[1]) - int(template_len[0])
-            elif READ_MODE in ['hifi', 'ont']:
-                rnm = splt[0]
-                template_len = len(splt[9])
-
-            if ref != prev_ref:
-                # compute coverage on previous ref now that we're done
-                if prev_ref is not None and len(alns_by_zmw) and prev_ref in CONTIG_SIZES:
-                    (covdat_by_ref[prev_ref], bed_results) = reads_2_cov(prev_ref, alns_by_zmw, OUT_DIR, CONTIG_SIZES, WINDOW_SIZE, bed_regions)
-                    all_bed_result.extend(bed_results)
-                    sys.stdout.write(f' ({int(time.perf_counter() - tt)} sec)\n')
-                    sys.stdout.flush()
-                # reset for next ref
-                if ref in CONTIG_SIZES:
-                    sys.stdout.write(f'processing reads on {ref}...')
-                    sys.stdout.flush()
-                    tt = time.perf_counter()
-                else:
-                    print('skipping reads on '+ref+'...')
-                alns_by_zmw = []
-                rnm_dict = {}
-                prev_ref = ref
-
-            if ref not in CONTIG_SIZES:
-                continue
-
-            letters = re.split(r"\d+",cigar)[1:]
-            numbers = [int(n) for n in re.findall(r"\d+",cigar)]
-            adj     = 0
-            for i in range(len(letters)):
-                if letters[i] in REF_CHAR:
-                    adj += numbers[i]
-
-            if rnm in rnm_dict:
-                my_rind = rnm_dict[rnm]
-            else:
-                rnm_dict[rnm] = len(rnm_dict)
-                my_rind       = len(rnm_dict)-1
-                alns_by_zmw.append([])
-                rlen_by_zmw.append(0)
-
-            alns_by_zmw[my_rind].append((pos, pos+adj))
-            rlen_by_zmw[my_rind] = max([rlen_by_zmw[my_rind], template_len])
-        samfile.close()
+        covdat_by_ref, all_bed_result, qc_metrics, rlen_by_zmw = process_bam_coverage(IN_BAM, CONTIG_SIZES, WINDOW_SIZE, bed_regions, MIN_MAPQ, READ_MODE)
 
         # qc
-        qc_metrics['total_reads'] = len(rlen_by_zmw)
-        qc_metrics['total_yield'] = sum(rlen_by_zmw)
-        qc_metrics['readlength_mean'] = int(np.mean(rlen_by_zmw))
-        qc_metrics['readlength_median'] = int(np.median(rlen_by_zmw))
-        qc_metrics['readlength_n50'] = compute_n50(rlen_by_zmw)
         qc_keys = ['total_reads', 'total_yield', 'bases_q20', 'readlength_mean', 'readlength_median', 'readlength_n50']
         with open(f'{OUT_DIR}qc.tsv', 'w') as f:
             f.write('\t'.join(qc_keys) + '\n')
@@ -256,24 +176,19 @@ def main(raw_args=None):
         mpl.xscale('log')
         mpl.xlim(1000, 1000000)
         mpl.grid(which='both', linestyle='--', alpha=0.5)
+        mpl.xlabel('read length (bp)')
         mpl.ylabel('read count')
         mpl.legend([f'{len(rlen_by_zmw)} total reads'])
         mpl.tight_layout()
         mpl.savefig(f'{PLOT_DIR}readlengths{IMAGE_SUFFIX}')
         mpl.close(fig)
 
-        # we probably we need to process the final ref, assuming no contigs beyond chrM
-        if ref not in covdat_by_ref and len(alns_by_zmw) and ref in CONTIG_SIZES:
-            (covdat_by_ref[ref], bed_results) = reads_2_cov(ref, alns_by_zmw, OUT_DIR, CONTIG_SIZES, WINDOW_SIZE, bed_regions)
-            all_bed_result.extend(bed_results)
-        sys.stdout.write(f' ({int(time.perf_counter() - tt)} sec)\n')
-        sys.stdout.flush()
-
         # save output
         sorted_chr = [n[1] for n in sorted([(LEXICO_2_IND[k],k) for k in covdat_by_ref.keys()])]
         np.savez_compressed(OUT_NPZ, ref_vers=REF_VERS, window_size=WINDOW_SIZE, sorted_chr=sorted_chr, **covdat_by_ref)
-    #
+
     elif IN_BAM[-4:].lower() == '.npz':
+
         print('reading from an existing npz archive instead of bam...')
         in_npz = np.load(IN_BAM)
         REF_VERS = str(in_npz['ref_vers'])
@@ -431,6 +346,7 @@ def main(raw_args=None):
     #
     # determine average coverage across whole genome
     # -- in normal samples this will correspond to 2 copies, but in tumors it might be 3+
+    # -- use specified reason for renormalizing coverage, if provided
     #
     all_win = []
     masked_covdat_by_ref = {}
@@ -459,6 +375,26 @@ def main(raw_args=None):
     # if both are zero, we received an empty or corrupt alignment
     else:
         avg_log2 = 0.0
+
+    # renormalize
+    if RENORMALIZE_TUPLE is not None:
+        (norm_chr, norm_start, norm_end, norm_copy) = RENORMALIZE_TUPLE
+        renorm_factor = 2.0/norm_copy
+        cy = np.copy(covdat_by_ref[norm_chr])
+        if norm_chr in unstable_by_chr:
+            for ur in unstable_by_chr[norm_chr]:
+                w1 = max(math.floor(ur[0]/WINDOW_SIZE) - BUFFER_UNSTABLE_COV, 0)
+                w2 = min(math.ceil(ur[1]/WINDOW_SIZE) + BUFFER_UNSTABLE_COV, len(cy)-1)
+                cy[w1:w2+1] = -1.0
+        cy = cy[math.floor(norm_start/WINDOW_SIZE):math.ceil(norm_end/WINDOW_SIZE)]
+        cy = cy[cy >= 0.0].tolist()
+        renorm_cov = (np.mean(cy), np.median(cy), np.std(cy))
+        if renorm_cov[1] > 0.0:
+            renorm_log2 = np.log2(renorm_cov[1]*renorm_factor)
+        elif renorm_cov[0] > 0.0:
+            renorm_log2 = np.log2(renorm_cov[0]*renorm_factor)
+        print(f'renormalizing avg log2 cov from {avg_log2:.3f} --> {renorm_log2:.3f}')
+        avg_log2 = renorm_log2
 
     fig = mpl.figure(1, figsize=(10,5))
     with np.errstate(divide='ignore', invalid='ignore'):
@@ -646,6 +582,7 @@ def main(raw_args=None):
                         training_data_out.append(['', my_chr, start_coords, end_coords] + my_featurevec)
                         scaled_featurevec = SVM_SCALAR.transform(np.array(my_featurevec).reshape(1,-1)) # reshape to make a 2d matrix with a single sample
                         svm_prediction = SVM_MODEL.predict(scaled_featurevec)[0]
+                        #print(my_chr, start_coords, end_coords, feature_cov, svm_prediction)
                 #
                 if svm_prediction is not None:
                     if svm_prediction == 6: # special case for LoH

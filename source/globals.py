@@ -8,7 +8,9 @@ CYTOBAND_COLORS = {'gneg':(255,255,255),
                    'gpos100':(90,55,103),
                    'acen':(139,112,144),
                    'stalk':(139,112,144),
-                   'gvar':(231,214,234)}
+                   'gvar':(231,214,234),
+                   'mappability_gneg':(230,230,230),
+                   'mappability_gpos50':(170,170,170)}
 CYTOBAND_COLORS = {k:(v[0]/255.,v[1]/255.,v[2]/255.) for k,v in CYTOBAND_COLORS.items()}
 
 CHROM_COLOR_CYCLE = [(32, 119, 184),
@@ -24,7 +26,8 @@ CHROM_COLOR_CYCLE = [(32, 119, 184),
 CHROM_COLOR_CYCLE = [(v[0]/255.,v[1]/255.,v[2]/255.) for v in CHROM_COLOR_CYCLE]
 
 # mask these regions when computing average coverage
-UNSTABLE_REGION = ['acen', 'gvar', 'stalk']
+#  - 'mappability' was manually added to the cytoband file for regions short reads were struggling with
+UNSTABLE_REGION = ['acen', 'gvar', 'stalk', 'mappability_gneg', 'mappability_gpos50']
 UNSTABLE_CHR = ['chrY', 'chrM']
 EXCLUDE_JUST_FROM_COV = ['chrX']
 
