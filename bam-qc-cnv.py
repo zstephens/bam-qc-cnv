@@ -551,9 +551,10 @@ def main(raw_args=None):
                 is_unstable = False
                 svm_prediction = None
                 if len(my_window_hets) >= CNV_MINVAR:
-                    bimodal_fit = fit_bimodal_gaussian(np.array(my_window_hets))
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        bimodal_fit = fit_bimodal_gaussian(np.array(my_window_hets))
                     #print(bimodal_fit)
-                    if bimodal_fit is None:
+                    if bimodal_fit is None or np.isnan(bimodal_fit['single_gaussian_log_likelihood']) or np.isnan(bimodal_fit['max_log_likelihood']) or np.isnan(bimodal_fit['single_gaussian_p-value']):
                         is_unstable = True
                     else:
                         norm_ll_component_ratio = abs((bimodal_fit['component1_log_likelihood'] - bimodal_fit['component2_log_likelihood']) / len(my_window_hets))
